@@ -1,14 +1,18 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use libc::{IN_CLOEXEC, IN_NONBLOCK, O_CLOEXEC, O_NONBLOCK, pipe2};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::Error;
 use std::os::raw::{c_char, c_int};
+use std::sync::Once;
 use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
+
+use env_logger::Env;
+use libc::{IN_CLOEXEC, IN_NONBLOCK, O_CLOEXEC, O_NONBLOCK, pipe2};
+use log::{debug, error};
 
 // Create a struct to hold the file descriptor and its associated data
 #[derive(Debug)]
@@ -16,9 +20,19 @@ struct InotifanHandle {
     rfd: c_int,
     wfd: c_int,
 }
+
+static INIT: Once = Once::new();
 // Create a global map to hold the file descriptors, use read write lock
 lazy_static::lazy_static! {
     static ref INOTIFAN_MAP: RwLock<HashMap<c_int, InotifanHandle>> = RwLock::new(HashMap::new());
+}
+
+fn init() {
+    INIT.call_once(|| {
+        let env = Env::default().filter_or("INOTIFAN_LOG_LEVEL", "info"); // Use a different env var to avoid conflicts
+        env_logger::init_from_env(env);
+        dbg!("Inotifan initialized");
+    });
 }
 
 // add all wfd in InotifanHandle to epoll and return the epoll fd
@@ -39,7 +53,7 @@ fn create_cleanup_epoll() -> i32 {
             let res =
                 unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, handle.wfd, &mut event) };
             if res != 0 {
-                eprintln!("Error adding wfd to epoll: {}", Error::last_os_error());
+                error!("Error adding wfd to epoll: {}", Error::last_os_error());
             }
         }
     }
@@ -53,7 +67,7 @@ fn remove_all_closed(fds: Vec<c_int>) -> bool {
         if let Some(handle) = map.remove(&fd) {
             // rfd is already closed
             unsafe { libc::close(handle.wfd) };
-            eprintln!("Removed closed file descriptor: {}", fd);
+            debug!("Removed closed file descriptor: {}", fd);
         }
     }
 
@@ -71,9 +85,10 @@ fn wait_for_events(epoll_fd: i32, timeout: Duration) -> Vec<i32> {
         )
     };
     if num_events == -1 {
-        eprintln!("Error waiting for epoll events: {}", Error::last_os_error());
+        error!("Error waiting for epoll events: {}", Error::last_os_error());
         return vec![];
     }
+    debug!("Number of events: {}", num_events);
 
     // create an array to hold the results
     let mut results = vec![];
@@ -95,6 +110,10 @@ fn start_thread() {
 
             if remove_all_closed(results) {
                 break;
+            }
+            let res = unsafe { libc::close(epoll_fd) };
+            if res == -1 {
+                error!("Error closing epoll fd: {}", Error::last_os_error());
             }
         }
     });
@@ -127,6 +146,7 @@ mod tests {
 // make constructor for InotifanHandle
 impl InotifanHandle {
     fn new(flags: c_int) -> Result<c_int, Error> {
+        init();
         // Create a pipe
         let pipe_flags: c_int = if flags & IN_NONBLOCK != 0 {
             O_NONBLOCK
@@ -188,7 +208,7 @@ pub unsafe extern "C" fn inotify_add_watch(
 ) -> c_int {
     // Convert the pathname to a Rust string
     let path = unsafe { CStr::from_ptr(c_pathname).to_string_lossy().into_owned() };
-    eprintln!(
+    debug!(
         "Intercepted inotify_add_watch (Pathname: {}, Mask: {})",
         path, _mask
     );
