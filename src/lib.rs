@@ -45,13 +45,32 @@ pub mod inotifan {
         pub name: Option<String>,
     }
 
+    #[repr(C)]
+    #[derive(Debug)]
+    struct CInotifyEvent {
+        wd: i32,
+        mask: u32,
+        cookie: u32,
+        len: u32,
+        name: [c_char; 0], // Flexible array member
+    }
+
     pub fn write_event(fd: c_int, event: InotifyEvent) -> io::Result<()> {
-        // Write the event to the file descriptor
+        let name_bytes = event.name.as_ref().map_or(&b""[..], |s| s.as_bytes());
+        let len = name_bytes.len() as u32;
+        let c_event = CInotifyEvent {
+            wd: event.wd,
+            mask: event.mask,
+            cookie: event.cookie,
+            len,
+            name: [0; 0], // Placeholder, will be overwritten
+        };
+
         let res = unsafe {
             libc::write(
                 fd,
-                &event as *const _ as *const libc::c_void,
-                std::mem::size_of::<InotifyEvent>(),
+                &c_event as *const _ as *const libc::c_void,
+                std::mem::size_of::<CInotifyEvent>(),
             )
         };
         if res < 0 {
