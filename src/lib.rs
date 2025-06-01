@@ -1,60 +1,133 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
+pub mod noop;
+mod rw_condvar;
+
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::io;
 use std::io::Error;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
 
 use env_logger::Env;
-use libc::{IN_CLOEXEC, IN_NONBLOCK, O_CLOEXEC, O_NONBLOCK, pipe2};
-use log::{debug, error};
+use libc::{IN_NONBLOCK, O_CLOEXEC, pipe2};
+use log::{debug, error, warn};
 
-// Create a struct to hold the file descriptor and its associated data
-#[derive(Debug)]
-struct InotifanHandle {
-    rfd: c_int,
-    wfd: c_int,
+pub mod inotifan {
+    use super::*;
+    pub trait Inotify: Send + Sync + AsRawFd {
+        /// Adds a watch for the given path.
+        fn add_watch(&self, path: &Path, mask: u32) -> io::Result<i32>;
+
+        /// Removes a watch.
+        fn rm_watch(&self, wd: i32) -> io::Result<()>;
+
+        fn read_events(&self) -> io::Result<Vec<InotifyEvent>>;
+
+        /// Closes the inotify file descriptor.
+        fn close(&self) -> io::Result<()>;
+    }
+
+    /// Represents an inotify event.
+    #[derive(Debug)]
+    pub struct InotifyEvent {
+        pub wd: i32,
+        pub mask: u32,
+        pub cookie: u32,
+        pub name: Option<String>,
+    }
+
+    pub fn write_event(fd: c_int, event: InotifyEvent) -> io::Result<()> {
+        // Write the event to the file descriptor
+        let res = unsafe {
+            libc::write(
+                fd,
+                &event as *const _ as *const libc::c_void,
+                std::mem::size_of::<InotifyEvent>(),
+            )
+        };
+        if res < 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
+    }
 }
+
+use inotifan::Inotify;
+
+type InotifyFd = RawFd;
 
 static INIT: Once = Once::new();
 // Create a global map to hold the file descriptors, use read write lock
 lazy_static::lazy_static! {
-    static ref INOTIFAN_MAP: RwLock<HashMap<c_int, InotifanHandle>> = RwLock::new(HashMap::new());
+    static ref INOTIFAN_MAP: RwLock<HashMap<InotifyFd, Box<dyn Inotify>>> = RwLock::new(HashMap::new());
+    static ref CV: rw_condvar::CondvarAny = rw_condvar::CondvarAny::new();
 }
+
+const ENV_LOG_LEVEL: &str = "INOTIFAN_LOG_LEVEL";
+const ENV_INOTIFY_BACKEND: &str = "INOTIFAN_BACKEND";
 
 fn init() {
     INIT.call_once(|| {
-        let env = Env::default().filter_or("INOTIFAN_LOG_LEVEL", "info"); // Use a different env var to avoid conflicts
+        let env = Env::default().filter_or(ENV_LOG_LEVEL, "info"); // Use a different env var to avoid conflicts
         env_logger::init_from_env(env);
-        dbg!("Inotifan initialized");
+        error!("Initializing inotify");
+        start_thread();
+    });
+}
+
+fn start_thread() {
+    thread::spawn(move || {
+        loop {
+            let epoll_fd = create_cleanup_epoll();
+            if epoll_fd == -2 {
+                debug!("No inotify handles to clean up, sleeping");
+                let _unused = CV.wait().unwrap();
+                continue;
+            }
+            let results = wait_for_events(epoll_fd, Duration::from_secs(1));
+            // so it will be dropped
+            let _owned_fd = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
+
+            if remove_all_closed(results) {
+                continue;
+            }
+        }
     });
 }
 
 // add all wfd in InotifanHandle to epoll and return the epoll fd
 fn create_cleanup_epoll() -> i32 {
+    let map = INOTIFAN_MAP.read().unwrap();
+    if map.is_empty() {
+        return -2;
+    }
     // create a new epoll instance
     let epoll_fd = unsafe { libc::epoll_create1(0) };
+    if epoll_fd == -1 {
+        error!("Error creating epoll instance: {}", Error::last_os_error());
+        return -1;
+    }
 
     // add all the wfd in InotifanHandle to epoll
-    let map = INOTIFAN_MAP.read().unwrap();
-    for (_, handle) in map.iter() {
+    for (wfd, _) in map.iter() {
         // Check if the wfd is valid
-        if handle.wfd > 0 {
-            // Add the wfd to epoll, store handle.rfd in epoll_event
-            let mut event = libc::epoll_event {
-                events: libc::EPOLLHUP as u32,
-                u64: handle.rfd as u64,
-            };
-            let res =
-                unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, handle.wfd, &mut event) };
-            if res != 0 {
-                error!("Error adding wfd to epoll: {}", Error::last_os_error());
-            }
+        // Add the wfd to epoll, store handle.rfd in epoll_event
+        let mut event = libc::epoll_event {
+            events: libc::EPOLLHUP as u32,
+            u64: *wfd as u64,
+        };
+        let res = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, *wfd, &mut event) };
+        if res != 0 {
+            error!("Error adding wfd to epoll: {}", Error::last_os_error());
         }
     }
     epoll_fd
@@ -64,11 +137,12 @@ fn remove_all_closed(fds: Vec<c_int>) -> bool {
     // Remove all closed file descriptors from the map
     let mut map = INOTIFAN_MAP.write().unwrap();
     for fd in fds {
-        if let Some(handle) = map.remove(&fd) {
-            // rfd is already closed
-            unsafe { libc::close(handle.wfd) };
+        if let Some(_) = map.remove(&fd) {
             debug!("Removed closed file descriptor: {}", fd);
+        } else {
+            warn!("File descriptor {} closed but handle not found!", fd);
         }
+        unsafe { libc::close(fd) };
     }
 
     return map.is_empty();
@@ -102,107 +176,108 @@ fn wait_for_events(epoll_fd: i32, timeout: Duration) -> Vec<i32> {
     results
 }
 
-fn start_thread() {
-    thread::spawn(move || {
-        loop {
-            let epoll_fd = create_cleanup_epoll();
-            let results = wait_for_events(epoll_fd, Duration::from_secs(1));
-
-            if remove_all_closed(results) {
-                break;
-            }
-            let res = unsafe { libc::close(epoll_fd) };
-            if res == -1 {
-                error!("Error closing epoll fd: {}", Error::last_os_error());
-            }
-        }
-    });
-}
-
 // write a test for create_cleanup_epoll
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_create_cleanup_epoll() {
-        // Create a new InotifanHandle
-        let handle = InotifanHandle::new(0).unwrap();
+    fn test_cleanup() {
+        let ifd = inotify_init();
+        assert!(ifd > 0);
+        // make sure we store the handle correctly
+        assert!(!INOTIFAN_MAP.read().unwrap().is_empty());
+
+        thread::sleep(Duration::from_secs(2));
+        // make sure we didn't remove an unclosed handle
+        assert!(!INOTIFAN_MAP.read().unwrap().is_empty());
+
         unsafe {
-            libc::close(handle);
+            libc::close(ifd);
         }
-        // Create a new epoll instance
-        let epoll_fd = create_cleanup_epoll();
-        // Check if the epoll fd is valid
-        assert!(epoll_fd > 0);
-        let res = wait_for_events(epoll_fd, Duration::from_secs(1));
-        assert!(!res.is_empty());
-        assert!(res[0] == handle, "{} != {}", res[0], handle);
-        remove_all_closed(res);
+
+        thread::sleep(Duration::from_secs(2));
+        // make sure we cleaned up this handle
+        assert!(INOTIFAN_MAP.read().unwrap().is_empty());
+
+        // create another handle to make sure we go from 1 to 0 back to 1 correctly
+        let ifd2 = inotify_init();
+        assert!(ifd2 > 0);
+        assert!(!INOTIFAN_MAP.read().unwrap().is_empty());
+
+        unsafe {
+            libc::close(ifd2);
+        }
+
+        thread::sleep(Duration::from_secs(2));
+        // this should be cleaned up
         assert!(INOTIFAN_MAP.read().unwrap().is_empty());
     }
 }
 
-// make constructor for InotifanHandle
-impl InotifanHandle {
-    fn new(flags: c_int) -> Result<c_int, Error> {
-        init();
-        // Create a pipe
-        let pipe_flags: c_int = if flags & IN_NONBLOCK != 0 {
-            O_NONBLOCK
-        } else {
-            0
-        } | if flags & IN_CLOEXEC != 0 {
-            O_CLOEXEC
-        } else {
-            0
-        };
+fn create_pipe(flags: c_int) -> io::Result<(c_int, c_int)> {
+    // Create a pipe for inotify
+    let mut fds: [c_int; 2] = [0; 2];
+    let res = unsafe { pipe2(fds.as_mut_ptr(), flags | O_CLOEXEC) };
+    if res != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
 
-        let mut fds: [c_int; 2] = [0; 2];
-        let res = unsafe { pipe2(fds.as_mut_ptr(), pipe_flags) };
-        if res != 0 {
-            return Err(Error::last_os_error());
+fn insert_handle<T: 'static>(h: T) -> io::Result<c_int>
+where
+    T: Inotify,
+{
+    let (rfd, wfd) = create_pipe(IN_NONBLOCK)?;
+    debug!("Created pipe: rfd = {}, wfd = {}", rfd, wfd);
+
+    let mut map = INOTIFAN_MAP.write().unwrap();
+    map.insert(wfd as InotifyFd, Box::new(h));
+    if map.len() == 1 {
+        CV.notify_one();
+    }
+    Ok(rfd)
+}
+
+fn internal_inotify_init(flags: c_int) -> c_int {
+    // Initialize the inotify system
+    init();
+
+    let backend = std::env::var(ENV_INOTIFY_BACKEND).unwrap_or_else(|_| "noop".to_string());
+    let handle = match backend.as_str() {
+        "noop" => noop::Inooptify::new(flags),
+        _ => {
+            error!("Unsupported inotify backend: {}", backend);
+            return -1;
         }
-        // Create a new InotifanHandle
-        let handle = InotifanHandle {
-            rfd: fds[0],
-            wfd: fds[1],
-        };
-        // Insert the handle into the map
-        let mut map = INOTIFAN_MAP.write().unwrap();
-        map.insert(handle.rfd, handle);
-        if map.len() == 1 {
-            // Start the cleanup thread if this is the first handle
-            start_thread();
+    };
+
+    match handle {
+        Ok(handle) => insert_handle(handle).unwrap_or(-1),
+        Err(e) => {
+            error!("Error initializing inotify: {}", e);
+            -1
         }
-        Ok(fds[0])
     }
 }
 
 // Intercepted inotify_init function (Returns a real file descriptor)
 #[unsafe(no_mangle)]
 pub extern "C" fn inotify_init() -> c_int {
-    let handle = InotifanHandle::new(0);
-    match handle {
-        Ok(h) => h,
-        Err(e) => e.raw_os_error().unwrap_or(-1),
-    }
+    internal_inotify_init(0)
 }
 
 // Intercepted inotify_init1 function (Returns a real file descriptor)
 #[unsafe(no_mangle)]
 pub extern "C" fn inotify_init1(flags: c_int) -> c_int {
-    let handle = InotifanHandle::new(flags);
-    match handle {
-        Ok(h) => h,
-        Err(e) => e.raw_os_error().unwrap_or(-1),
-    }
+    internal_inotify_init(flags)
 }
 
 // Intercepted inotify_add_watch function (Returns a dummy watch descriptor)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inotify_add_watch(
-    _fd: c_int,
+    fd: c_int,
     c_pathname: *const c_char,
     _mask: u32,
 ) -> c_int {
@@ -212,13 +287,37 @@ pub unsafe extern "C" fn inotify_add_watch(
         "Intercepted inotify_add_watch (Pathname: {}, Mask: {})",
         path, _mask
     );
-
-    1 // Return a dummy valid watch descriptor
+    let map = INOTIFAN_MAP.read().unwrap();
+    let handle = map.get(&fd);
+    if handle.is_none() {
+        error!("Invalid file descriptor: {}", fd);
+        return -1;
+    }
+    let handle = handle.unwrap();
+    let res = handle.add_watch(PathBuf::from(path).as_path(), _mask);
+    if res.is_err() {
+        error!("Error adding watch: {}", res.unwrap_err());
+        return -1;
+    }
+    res.unwrap()
 }
 
 // Intercepted inotify_rm_watch function (Closes the file descriptor and returns success)
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn inotify_rm_watch(_fd: c_int, _wd: c_int) -> c_int {
+pub unsafe extern "C" fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int {
+    let map = INOTIFAN_MAP.read().unwrap();
+    let handle = map.get(&fd);
+    if handle.is_none() {
+        error!("Invalid file descriptor: {}", fd);
+        return -1;
+    }
+    let handle = handle.unwrap();
+    let res = handle.rm_watch(wd);
+    if res.is_err() {
+        error!("Error adding watch: {}", res.unwrap_err());
+        return -1;
+    }
+
     0
 }
 
